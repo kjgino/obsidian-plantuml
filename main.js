@@ -7164,7 +7164,11 @@ var DebouncedProcessors = class {
     this.SECONDS_TO_MS_FACTOR = 1e3;
     this.debounceMap = /* @__PURE__ */ new Map();
     this.default = (source, el, ctx) => __async(this, null, function* () {
-      yield this.png(source, el, ctx);
+      if (this.plugin.settings.defaultProcessor === "svg") {
+        yield this.svg(source, el, ctx);
+      } else {
+        yield this.png(source, el, ctx);
+      }
     });
     this.png = (source, el, ctx) => __async(this, null, function* () {
       yield this.processor(source, el, ctx, "png", this.plugin.getProcessor().png);
