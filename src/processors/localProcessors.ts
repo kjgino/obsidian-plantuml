@@ -65,93 +65,131 @@ export class LocalProcessors implements Processor {
     }
 
     async generateLocalMap(source: string, path: string): Promise<string> {
-        const {exec} = require('child_process');
+        // exec()ではなくspawn()を使用することで、Windows環境での引用符の問題を回避
+        // spawn()は引数を配列として受け取るため、パスにスペースが含まれていても正しく処理される
+        const {spawn} = require('child_process');
         const args = this.resolveLocalJarCmd().concat(['-pipemap']);
-        const child = exec(args.join(" "), {encoding: 'binary', cwd: path});
+        const [command, ...commandArgs] = args;
+        const child = spawn(command, commandArgs, {cwd: path});
 
         let stdout = "";
+        let stderr = "";
 
         if (child.stdout) {
-            child.stdout.on("data", (data: any) => {
-                stdout += data;
+            child.stdout.on("data", (data: Buffer) => {
+                stdout += data.toString('binary');
+            });
+        }
+
+        if (child.stderr) {
+            child.stderr.on('data', (data: Buffer) => {
+                stderr += data.toString('utf-8');
             });
         }
 
         return new Promise((resolve, reject) => {
-            child.on("error", reject);
+            child.on("error", (error: Error) => {
+                // プロセス起動時のエラー（Javaが見つからない、JARファイルが存在しないなど）
+                console.error("PlantUML map generation error:", error);
+                reject(error);
+            });
 
             child.on("close", (code: any) => {
                 if (code === 0) {
+                    // 正常終了：画像マップデータを返す
                     resolve(stdout);
                     return;
-                } else if (code === 1) {
-                    console.log(stdout);
-                    reject(new Error(`an error occurred`));
                 } else {
-                    reject(new Error(`child exited with code ${code}`));
+                    // エラー終了：stderr、stdout、またはデフォルトメッセージを使用
+                    const errorMsg = stderr || stdout || `PlantUML map generation exited with code ${code}`;
+                    console.error("PlantUML map generation error (code " + code + "):", errorMsg);
+                    reject(new Error(errorMsg));
                 }
             });
 
-            child.stdin.write(source);
+            child.stdin.write(source, 'utf-8');
             child.stdin.end();
         });
     }
 
     async generateLocalImage(source: string, type: OutputType, path: string): Promise<string> {
-        const {ChildProcess, exec} = require('child_process');
+        // exec()ではなくspawn()を使用することで、Windows環境での引用符の問題を回避
+        // spawn()は引数を配列として受け取るため、パスにスペースが含まれていても正しく処理される
+        // これにより、-graphvizdotオプションのパスが正しく認識される
+        const {spawn} = require('child_process');
         const args = this.resolveLocalJarCmd().concat(['-t' + type, '-pipe']);
+        const [command, ...commandArgs] = args;
+        const child = spawn(command, commandArgs, {cwd: path});
 
-        let child: typeof ChildProcess;
-        if (type === OutputType.PNG) {
-            child = exec(args.join(" "), {encoding: 'binary', cwd: path});
-        } else {
-            child = exec(args.join(" "), {encoding: 'utf-8', cwd: path});
-        }
-
-        let stdout: any;
-        let stderr: any;
+        let stdoutChunks: Buffer[] = [];
+        let stderr: string = "";
 
         if (child.stdout) {
-            child.stdout.on("data", (data: any) => {
-                if (stdout === undefined) {
-                    stdout = data;
-                } else stdout += data;
+            child.stdout.on("data", (data: Buffer) => {
+                stdoutChunks.push(data);
             });
         }
 
         if (child.stderr) {
-            child.stderr.on('data', (data: any) => {
-                if (stderr === undefined) {
-                    stderr = data;
-                } else stderr += data;
+            child.stderr.on('data', (data: Buffer) => {
+                stderr += data.toString('utf-8');
             });
         }
 
         return new Promise((resolve, reject) => {
-            child.on("error", reject);
+            child.on("error", (error: Error) => {
+                console.error("PlantUML execution error:", error);
+                reject(error);
+            });
 
             child.on("close", (code: any) => {
-                if(stdout === undefined) {
-                    return;
-                }
-                if (code === 0) {
-                    if (type === OutputType.PNG) {
-                        const buf = new Buffer(stdout, 'binary');
-                        resolve(buf.toString('base64'));
-                        return;
-                    }
-                    resolve(stdout);
-                    return;
-                } else if (code === 1) {
-                    console.error(stdout);
-                    reject(new Error(stderr));
+                // spawn()は複数のBufferチャンクを返す可能性があるため、結合する必要がある
+                let combined: Buffer;
+                if (stdoutChunks.length === 0) {
+                    combined = Buffer.alloc(0);
+                } else if (stdoutChunks.length === 1) {
+                    combined = stdoutChunks[0];
                 } else {
-                    if (type === OutputType.PNG) {
-                        const buf = new Buffer(stdout, 'binary');
-                        resolve(buf.toString('base64'));
+                    // 複数のチャンクを1つのBufferに結合
+                    const totalLength = stdoutChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+                    combined = Buffer.allocUnsafe(totalLength);
+                    let offset = 0;
+                    for (const chunk of stdoutChunks) {
+                        // @ts-ignore - Buffer.copy()は正しく動作するが、型定義に問題がある
+                        chunk.copy(combined, offset);
+                        offset += chunk.length;
+                    }
+                }
+
+                if (code === 0) {
+                    // 正常終了の場合
+                    if (combined.length === 0) {
+                        // 出力がない場合はエラー（Graphvizが見つからない場合など）
+                        const errorMsg = stderr || "No output from PlantUML";
+                        console.error("PlantUML error:", errorMsg);
+                        reject(new Error(errorMsg));
                         return;
                     }
-                    resolve(stdout);
+                    if (type === OutputType.PNG) {
+                        // PNGはバイナリデータなのでbase64エンコード
+                        resolve(combined.toString('base64'));
+                        return;
+                    }
+                    // SVG, ASCIIなどのテキスト形式はUTF-8でデコード
+                    resolve(combined.toString('utf-8'));
+                    return;
+                } else {
+                    // エラーコードが0以外の場合（エラー終了）
+                    // stderrにエラーメッセージが含まれている可能性が高い
+                    const errorMsg = stderr || `PlantUML exited with code ${code}`;
+                    console.error("PlantUML error (code " + code + "):", errorMsg);
+                    // PNGの場合、エラーでも部分的に画像データが生成されている可能性がある
+                    // その場合は画像を返す（エラーメッセージが画像に含まれる場合もある）
+                    if (combined.length > 0 && type === OutputType.PNG) {
+                        resolve(combined.toString('base64'));
+                        return;
+                    }
+                    reject(new Error(errorMsg));
                     return;
                 }
             });
@@ -189,13 +227,42 @@ export class LocalProcessors implements Processor {
             throw Error('Invalid local jar file');
         }
 
+        // spawn()を使うため、引用符は不要（引数は配列として渡される）
+        const dotPath = this.plugin.settings.dotPath;
+        const plantumlArgs = [
+            '-charset', 
+            'utf-8'
+        ];
+        
+        // -graphvizdotオプションの条件付き追加
+        // PlantUMLはGraphvizのdotコマンドを自動検出できるため、明示的な指定は必須ではない
+        // 以下の場合のみ、-graphvizdotオプションを追加する：
+        // 1. dotPathが設定されている
+        // 2. 空文字列でない
+        // 3. デフォルト値('dot')でない（システムパスにdotがある場合は自動検出に任せる）
+        // 
+        // これにより、Graphvizがシステムパスにある環境では自動検出が使用され、
+        // カスタムパスが必要な環境では明示的に指定できる
+        if (dotPath && dotPath.trim() !== '' && dotPath !== 'dot') {
+            plantumlArgs.push('-graphvizdot', dotPath);
+        }
+
         if(jarFullPath.endsWith('.jar')) {
+            // JVMオプション（-Djava.awt.headless=true）は-jarの前に配置する必要がある
+            // これはJavaのコマンドライン引数の仕様による
             return [
-                this.plugin.settings.javaPath, '-jar', '-Djava.awt.headless=true', '"' + jarFullPath + '"', '-charset', 'utf-8', '-graphvizdot', '"' + this.plugin.settings.dotPath + '"'
+                this.plugin.settings.javaPath, 
+                '-Djava.awt.headless=true',  // JVMオプション：GUIなしで実行
+                '-jar', 
+                jarFullPath,
+                ...plantumlArgs  // PlantUMLのオプション
             ];
         }
+        // jarファイルでない場合（直接実行可能な場合）
         return [
-            jarFullPath, '-Djava.awt.headless=true', '-charset', 'utf-8', '-graphvizdot', '"' + this.plugin.settings.dotPath + '"'
+            jarFullPath, 
+            '-Djava.awt.headless=true',
+            ...plantumlArgs
         ];
     }
 }
